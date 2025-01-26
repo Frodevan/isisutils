@@ -37,37 +37,71 @@ def hex_dump(b):
         print()
 
 
-cylinders = 77
 bytes_per_sector = 128
+bytes_per_linking_block = 128
+format = 'intel'
 
 
 def load_raw_image(f):
+    global format, bytes_per_sector
     imd = ImageDisk()
     raw_image = f.read()
+    heads = 1
+    cylinders = 77
+    sectors_per_track = 26
+    bytes_per_sector00 = 128
+    mode00 = 0x00
+    mode = 0x00
     if len(raw_image) == 256256:
         # IBM 3740 single-density FM format
-        sectors_per_track = 26
-        mode = 0x00
+        pass
     elif len(raw_image) == 512512:
         # Intel SBC 202 double-density M2FM format
         sectors_per_track = 52
+        mode00 = 0x03
         mode = 0x03  # ImageDisk doesn't (yet?) have a defined mode for
                      # Intel M2FM
+    elif len(raw_image) == 1021696:
+        # Tandberg TOS-II double-density MFM format
+        bytes_per_sector = 256
+        heads = 2
+        mode = 0x03
+        format = 'tandberg dsdd'
     else:
         raise Exception("unrecognized raw image size")
     offset = 0
     for track in range(cylinders):
-        for sector in range(sectors_per_track):
-            data = raw_image[offset:offset + bytes_per_sector]
-            imd.write_sector(mode, track, 0, sector + 1, data)
-            offset += bytes_per_sector
+        for head in range(heads):
+            for sector in range(sectors_per_track):
+                if track == 0 and head == 0:
+                    data = raw_image[offset:offset + bytes_per_sector00]
+                    imd.write_sector(mode00, track, head, sector + 1, data)
+                    offset += bytes_per_sector00
+                else:
+                    data = raw_image[offset:offset + bytes_per_sector]
+                    imd.write_sector(mode, track, head, sector + 1, data)
+                    offset += bytes_per_sector
     return imd;
 
 
 # Note that sector numbers are based at 1 rather than zero
 def get_sector(imd, addr):
+    if addr[0] >= 128:
+        return imd.read_sector(addr[0]-128, 1, addr[1])
     return imd.read_sector(addr[0], 0, addr[1])
 
+def get_tandberg_dsdd_dir(imd, link_addr):
+    eof_reached = False
+    data = bytearray()
+
+    for sector in range(link_addr[1], link_addr[1]+3):
+        link_block = get_sector(imd, (link_addr[0], sector))
+        for i in range(0, bytes_per_sector, 2):
+            data_block_addr = (link_block[i+1], link_block[i])
+            if data_block_addr == (0, 0):
+                return data
+            else:
+                data += get_sector(imd, data_block_addr)
 
 def get_file_given_link_addr(imd, link_addr):
     expected_prev_link_addr = (0, 0)
@@ -79,7 +113,7 @@ def get_file_given_link_addr(imd, link_addr):
         prev_link_addr = (link_block[1], link_block[0])
         next_link_addr = (link_block[3], link_block[2])
         assert prev_link_addr == expected_prev_link_addr
-        for i in range(4, bytes_per_sector, 2):
+        for i in range(4, bytes_per_linking_block, 2):
             data_block_addr = (link_block[i+1], link_block[i])
             if eof_reached:
                 assert data_block_addr == (0, 0)
@@ -102,7 +136,7 @@ def print_file_block_addresses(link_addr):
         prev_link_addr = (link_block[1], link_block[0])
         next_link_addr = (link_block[3], link_block[2])
         assert prev_link_addr == expected_prev_link_addr
-        for i in range(4, bytes_per_sector, 2):
+        for i in range(4, bytes_per_linking_block, 2):
             data_block_addr = (link_block[i+1], link_block[i])
             if eof_reached:
                 assert data_block_addr == (0, 0)
@@ -138,6 +172,8 @@ dest_parser = parser.add_mutually_exclusive_group()
 dest_parser.add_argument('-d', '--destdir', type = str, help = 'destination directory')
 dest_parser.add_argument('-z', '--destzip', type=argparse.FileType('wb'), help = 'destination ZIP file')
 
+parser.add_argument('-l', '--lower', action = 'store_true', help = 'convert filenames to lowercase')
+
 parser.add_argument('-r', '--raw', action = 'store_true', help = 'use a raw binary file rather than an ImageDisk image')
 
 parser.add_argument('--debug', action = 'store_true', help = argparse.SUPPRESS)
@@ -163,39 +199,73 @@ if args.destzip is not None:
 else:
     destzip = None
 
-dir_link_addr = (1, 1)
-dir = get_file_given_link_addr(imd, dir_link_addr)
+if format == 'intel':
+    dir_link_addr = (1, 1)
+    dir = get_file_given_link_addr(imd, dir_link_addr)
+    dir_entry_len = 16
+    filename_len = 6
+    block_count_word = 12
+    byte_count_word_lsb = 11
+    byte_count_word_msb = 0 # Not used, so point to the byte that's always 0
+    link_address_word = 14
+elif format == 'tandberg dsdd':
+    dir_link_addr = (1, 4)
+    dir = get_tandberg_dsdd_dir(imd, dir_link_addr)
+    dir_entry_len = 32
+    filename_len = 8
+    block_count_word = 19
+    byte_count_word_lsb = 17
+    byte_count_word_msb = 18
+    link_address_word = 30
+else:
+    raise Exception('Unknoen disk format')
 if args.dir:
-    print('filename   attr length link block')
-    print('---------- ---- ------ ----------')
-for i in range(len(dir)//16):
-    dir_entry = dir[i*16:i*16+16]
+    print('filename     attr   length link block')
+    print('------------ ------ ------ ----------')
+for i in range(len(dir)//dir_entry_len):
+    dir_entry = dir[i*dir_entry_len:(i+1)*dir_entry_len]
     if dir_entry[0] == 0x7f:
         continue # unused entry
     elif dir_entry[0] == 0xff:
         continue # deleted entry
     else:
         assert(dir_entry[0] == 0x00)
-    basename = dir_entry[1:7].decode('ascii').rstrip('\0')
-    extension = dir_entry[7:10].decode('ascii').rstrip('\0')
+    basename = dir_entry[1:filename_len+1].decode('ascii').rstrip('\0')
+    extension = dir_entry[filename_len+1:filename_len+4].decode('ascii').rstrip('\0')
     filename = basename
     if extension != '':
         filename += '.' + extension
-    filename = filename.lower()
-    assert dir_entry[10] & 0x78 == 0
-    attributes = ('.F' [(dir_entry[10] >> 7) & 1] +
-                  '.P' [(dir_entry[10] >> 2) & 1] +
-                  '.S' [(dir_entry[10] >> 1) & 1] +
-                  '.I' [(dir_entry[10] >> 0) & 1])
-    file_length = (dir_entry[12] + 256 * dir_entry[13]) * bytes_per_sector - bytes_per_sector + dir_entry[11]
-    link_addr = (dir_entry[15], dir_entry[14])
+    if args.lower:
+        filename = filename.lower()
+
+    if format == 'intel':
+        assert dir_entry[10] & 0x30 == 0
+        attributes = ('.F' [(dir_entry[10] >> 7) & 1] +
+                      '.X' [(dir_entry[10] >> 6) & 1] + # Tandberg OS Direct-Access file
+                      '.A' [(dir_entry[10] >> 3) & 1] + # Tandberg OS Alias file
+                      '.P' [(dir_entry[10] >> 2) & 1] +
+                      '.S' [(dir_entry[10] >> 1) & 1] +
+                      '.I' [(dir_entry[10] >> 0) & 1])
+    elif format == 'tandberg dsdd':
+        #
+        # New attributes in TOS-II include:
+        #  -> D: Direct file
+        #  -> M: Reserved
+        #  -> N: New file on harddisk (not backed up)
+        #
+        # However, the layout of the attribute word is unknown due to lack of documentation
+        #
+        attributes = '{:02X}.{:02X}.'.format(dir_entry[14], dir_entry[15])
+
+    file_length = (dir_entry[block_count_word] + 256 * dir_entry[block_count_word+1]) * bytes_per_sector - bytes_per_sector + dir_entry[byte_count_word_lsb] + dir_entry[byte_count_word_msb]*256
+    link_addr = (dir_entry[link_address_word+1], dir_entry[link_address_word])
 
     if args.pattern is not None:
         if not fnmatch.fnmatch(filename, args.pattern):
             continue
 
     if args.dir:
-        print('%-10s %s %6d (%3d,%3d)' % (filename, attributes, file_length, link_addr[0], link_addr[1]))
+        print('%-12s %s %6d (%3d,%3d)' % (filename, attributes, file_length, link_addr[0], link_addr[1]))
         if args.debug:
             print_file_block_addresses(link_addr)
         continue
