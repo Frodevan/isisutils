@@ -40,6 +40,7 @@ def hex_dump(b):
 bytes_per_sector = 128
 bytes_per_linking_block = 128
 format = 'intel'
+used_blocks = []
 
 
 def load_raw_image(f):
@@ -109,6 +110,7 @@ def get_file_given_link_addr(imd, link_addr):
     data = bytearray()
 
     while link_addr != (0, 0):
+        used_blocks.append(link_addr)
         link_block = get_sector(imd, link_addr)
         prev_link_addr = (link_block[1], link_block[0])
         next_link_addr = (link_block[3], link_block[2])
@@ -120,6 +122,7 @@ def get_file_given_link_addr(imd, link_addr):
             elif data_block_addr == (0, 0):
                 eof_reached = True
             else:
+                used_blocks.append(data_block_addr)
                 data += get_sector(imd, data_block_addr)
         expected_prev_link_addr = link_addr
         link_addr = next_link_addr
@@ -132,6 +135,7 @@ def print_file_block_addresses(link_addr):
     data = bytearray()
 
     while link_addr != (0, 0):
+        used_blocks.append(link_addr)
         link_block = get_sector(imd, link_addr)
         prev_link_addr = (link_block[1], link_block[0])
         next_link_addr = (link_block[3], link_block[2])
@@ -143,6 +147,7 @@ def print_file_block_addresses(link_addr):
             elif data_block_addr == (0, 0):
                 eof_reached = True
             else:
+                used_blocks.append(data_block_addr)
                 print('    %d %d' % (data_block_addr[0], data_block_addr[1]))
         expected_prev_link_addr = link_addr
         link_addr = next_link_addr
@@ -177,6 +182,7 @@ parser.add_argument('-l', '--lower', action = 'store_true', help = 'convert file
 parser.add_argument('-r', '--raw', action = 'store_true', help = 'use a raw binary file rather than an ImageDisk image')
 
 parser.add_argument('--debug', action = 'store_true', help = argparse.SUPPRESS)
+parser.add_argument('--mapdump', action = 'store_true', help = argparse.SUPPRESS)
 
 
 parser.add_argument('image',   type=argparse.FileType('rb'), help = 'floppy image')
@@ -287,3 +293,42 @@ for i in range(len(dir)//dir_entry_len):
                 f.write(file_data)
 if destzip is not None:
     destzip.close()
+
+if args.mapdump:
+
+    if format == 'intel':
+        map = [0 for _ in range(256)]
+    elif format == 'tandberg dsdd':
+        # Reserved by TOS-II, without assigning file-entries
+        for sector in range(1, 27):
+            used_blocks.append((0x80 + 1, sector))
+        for sector in range(1, 7):
+            used_blocks.append((2, sector))
+        map = [0 for _ in range(512)]
+
+    print('\nBlocks used during operation:')
+    used_blocks = list(set(used_blocks))
+    used_blocks.sort()
+    btrack = -1
+    for block in used_blocks:
+        if btrack != block[0]:
+            btrack = block[0]
+            print('\nhead {} cyl {:02}:   '.format((btrack & 0x80) >> 7, btrack & 0x7F), end='')
+        print('{} '.format(block[1]), end='')
+
+        if format == 'intel':
+            block_nr = block[0]*26 + (block[1]-1)
+        elif format == 'tandberg dsdd':
+            block_nr = (block[0]%0x80)*52 + int(block[0]/0x80)*26 + (block[1]-1) - 3*26
+        bit_mask = 0x80>>block_nr%8
+        byte_nr = int(block_nr/8)
+        map[byte_nr] = map[byte_nr]|bit_mask
+    print('\n\nmapfile (of directory and extracted files):\n\n    ', end='')
+
+    mapbyte_count = 0
+    for v in map:
+        mapbyte_count += 1
+        if mapbyte_count%16 == 0:
+            print('{:02X} \n    '.format(v), end='')
+        else:
+            print('{:02X} '.format(v), end='')
