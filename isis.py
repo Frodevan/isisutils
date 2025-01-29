@@ -26,6 +26,193 @@ import zipfile
 from imagedisk import ImageDisk
 
 
+class LayoutFormat:
+
+    def __init__(self, format):
+        self.bytes_per_linking_block = 128
+        if 'intel' in format:
+            self.type = 'intel'
+            self.bytes_per_block = 128
+            self.filename_len = 6
+            self.attribute_word = 10
+            self.attribute_mask = 0xff
+            self.byte_count_word = 11
+            self.byte_count_mask = 0xff
+            self.block_count_word = 12
+            self.link_address_word = 14
+            self.attribute_list = {'I': 0, 'S': 1, 'P': 2, 'A': 3, 'X': 6, 'F': 7}
+        elif format == 'tandberg dsdd':
+            self.type = 'tandberg dsdd'
+            self.bytes_per_block = 256
+            self.filename_len = 8
+            self.attribute_word = 14
+            self.attribute_mask = 0xffff
+            self.byte_count_word = 17
+            self.byte_count_mask = 0xffff
+            self.block_count_word = 19
+            self.link_address_word = 30
+            self.attribute_list = {} # Documentation missing, unknown bit-positions
+        else:
+            raise Exception('Unknown disk format')
+
+
+class IsisFile:
+
+    def __init__(self, dir_entry, format):
+        self.format = format
+
+        self.basename = dir_entry[1:format.filename_len+1].decode('ascii').rstrip('\0')
+        self.extension = dir_entry[format.filename_len+1:format.filename_len+4].decode('ascii').rstrip('\0')
+        self.attributes = {}
+        attribute_data = self._get_word(dir_entry, format.attribute_word, format.attribute_mask)
+        for attribute, bit in format.attribute_list.items():
+            self.attributes[attribute] = bool((attribute_data >> bit) & 1)
+
+        self.whole_blocks_used = self._get_word(dir_entry, format.block_count_word) - 1
+        self.bytes_in_last_block = self._get_word(dir_entry, format.byte_count_word, format.byte_count_mask)
+        self.link_block_addr = (dir_entry[format.link_address_word+1], dir_entry[format.link_address_word])
+
+    @staticmethod
+    def _get_word(data, offset, mask = 0xFFFF):
+        return (data[offset] + (data[offset+1] << 8)) & mask
+
+    def get_link_addr(self):
+        return self.link_block_addr
+
+    def get_size(self):
+        return self.whole_blocks_used * self.format.bytes_per_block + self.bytes_in_last_block
+
+    def get_filename(self, force_lowercase = False):
+        ret = self.basename
+        if self.extension != '':
+            ret += '.' + self.extension
+        if force_lowercase:
+            return ret.lower()
+        return ret
+
+    def get_attribute_byte(self):
+        ret = 0
+        for attribute, active in self.attributes.items():
+            if active:
+                ret = ret|(1 << format.attribute_list[attribute])
+
+    def get_attribute_str(self):
+        return ''.join([attribute if active else '.' for attribute, active in self.attributes.items()])
+
+    def get_directory_str(self, force_lowercase = False):
+        return '%-12s %s %6d (%3d,%3d)' % (self.get_filename(force_lowercase), self.get_attribute_str(), self.get_size(), self.link_block_addr[0], self.link_block_addr[1])
+
+
+class IsisFilesystem:
+
+    def __init__(self, image, format):
+        self.image = image
+        self.format = format
+        self.file_entries = []
+        if format.type == 'intel':
+            directory_data = self._get_intel_dir((1, 1))
+            dir_entry_len = 16
+        elif format.type == 'tandberg dsdd':
+            directory_data = self._get_tandberg_dsdd_dir((1, 4))
+            dir_entry_len = 32
+        else:
+            raise Exception('Unknown disk format')
+
+        for i in range(len(directory_data)//dir_entry_len):
+            dir_entry = directory_data[i*dir_entry_len:(i+1)*dir_entry_len]
+            if dir_entry[0] == 0x7f:
+                continue # unused entry
+            elif dir_entry[0] == 0xff:
+                continue # deleted entry
+            elif dir_entry[0] == 0x00:
+                self.file_entries.append(IsisFile(dir_entry, format))
+
+    def _get_intel_dir(self, link_addr):
+        return self.get_data(self.get_data_blocks([link_addr]))
+
+    def _get_tandberg_dsdd_dir(self, link_addr):
+        eof_reached = False
+        blocks = []
+
+        for block in range(link_addr[1], link_addr[1]+2):
+            link_block = get_sector(self.image, (link_addr[0], block))
+            for i in range(0, self.format.bytes_per_block, 2):
+                data_block_addr = (link_block[i+1], link_block[i])
+                if data_block_addr == (0, 0):
+                    return self.get_data(blocks)
+                else:
+                    blocks.append(data_block_addr)
+
+    def get_files(self):
+        return self.file_entries
+
+    def get_link_blocks(self, file_entry):
+        link_blocks = []
+        expected_prev_link_addr = (0, 0)
+        link_addr = file_entry.get_link_addr()
+        while link_addr != (0, 0):
+            link_blocks.append(link_addr)
+            link_block = get_sector(self.image, link_addr)
+            prev_link_addr = (link_block[1], link_block[0])
+            next_link_addr = (link_block[3], link_block[2])
+            assert prev_link_addr == expected_prev_link_addr
+            expected_prev_link_addr = link_addr
+            link_addr = next_link_addr
+        return link_blocks
+
+    def get_data_blocks(self, link_blocks):
+        blocks = []
+        for block in link_blocks:
+            link_block = get_sector(self.image, block)
+            for i in range(4, self.format.bytes_per_linking_block, 2):
+                data_block_addr = (link_block[i+1], link_block[i])
+                if data_block_addr == (0, 0):
+                    break
+                else:
+                    blocks.append(data_block_addr)
+        return blocks
+
+    def get_data(self, data_blocks):
+        data = bytearray()
+        for block in data_blocks:
+            data += get_sector(self.image, block)
+        return data
+
+    def get_file_data(self, file_entry):
+        return self.get_data(self.get_data_blocks(self.get_link_blocks(file_entry)))
+
+    def get_used_blocks(self):
+        used_blocks = []
+        if self.format.type == 'tandberg dsdd':
+            # Blocks reserved by TOS-II, without assigning file-entries
+            for sector in range(1, 27):
+                used_blocks.append((0x80 + 1, sector))
+            for sector in range(1, 7):
+                used_blocks.append((2, sector))
+        for file in self.file_entries:
+            link_blocks = filesystem.get_link_blocks(file)
+            used_blocks.extend(link_blocks)
+            used_blocks.extend(self.get_data_blocks(link_blocks))
+        used_blocks.sort(key=lambda x: (((x[0]&0x7f)<<1)|((x[0]&0x80)>>7), x[1]))
+        return used_blocks
+
+    def get_mapfile(self):
+        if self.format.type == 'intel':
+            map = [0 for _ in range(256)]
+        elif self.format.type == 'tandberg dsdd':
+            map = [0 for _ in range(512)]
+
+        for block in self.get_used_blocks():
+            if format.type == 'intel':
+                block_nr = block[0]*26 + (block[1]-1)
+            elif format.type == 'tandberg dsdd':
+                block_nr = (block[0]&0x7f)*52 + ((block[0]&0x80)>>7)*26 + (block[1]-1) - 3*26
+            bit_mask = 0x80>>block_nr%8
+            byte_nr = int(block_nr/8)
+            map[byte_nr] = map[byte_nr]|bit_mask
+        return map
+
+
 def hex_dump(b):
     for i in range(0, len(b), 16):
         print('%04x:' % i, end = '')
@@ -37,37 +224,35 @@ def hex_dump(b):
         print()
 
 
-bytes_per_sector = 128
-bytes_per_linking_block = 128
-format = 'intel'
-used_blocks = []
-
+format = None
 
 def load_raw_image(f):
-    global format, bytes_per_sector
+    global format
     imd = ImageDisk()
     raw_image = f.read()
     heads = 1
     cylinders = 77
     sectors_per_track = 26
     bytes_per_sector00 = 128
+    bytes_per_sector = 128
     mode00 = 0x00
     mode = 0x00
     if len(raw_image) == 256256:
         # IBM 3740 single-density FM format
-        pass
+        format = LayoutFormat('intel')
     elif len(raw_image) == 512512:
         # Intel SBC 202 double-density M2FM format
+        format = LayoutFormat('intel dd')
         sectors_per_track = 52
         mode00 = 0x03
         mode = 0x03  # ImageDisk doesn't (yet?) have a defined mode for
                      # Intel M2FM
     elif len(raw_image) == 1021696:
         # Tandberg TOS-II double-density MFM format
+        format = LayoutFormat('tandberg dsdd')
         bytes_per_sector = 256
         heads = 2
         mode = 0x03
-        format = 'tandberg dsdd'
     else:
         raise Exception("unrecognized raw image size")
     offset = 0
@@ -90,67 +275,6 @@ def get_sector(imd, addr):
     if addr[0] >= 128:
         return imd.read_sector(addr[0]-128, 1, addr[1])
     return imd.read_sector(addr[0], 0, addr[1])
-
-def get_tandberg_dsdd_dir(imd, link_addr):
-    eof_reached = False
-    data = bytearray()
-
-    for sector in range(link_addr[1], link_addr[1]+2):
-        link_block = get_sector(imd, (link_addr[0], sector))
-        for i in range(0, bytes_per_sector, 2):
-            data_block_addr = (link_block[i+1], link_block[i])
-            if data_block_addr == (0, 0):
-                return data
-            else:
-                data += get_sector(imd, data_block_addr)
-
-def get_file_given_link_addr(imd, link_addr):
-    expected_prev_link_addr = (0, 0)
-    eof_reached = False
-    data = bytearray()
-
-    while link_addr != (0, 0):
-        used_blocks.append(link_addr)
-        link_block = get_sector(imd, link_addr)
-        prev_link_addr = (link_block[1], link_block[0])
-        next_link_addr = (link_block[3], link_block[2])
-        assert prev_link_addr == expected_prev_link_addr
-        for i in range(4, bytes_per_linking_block, 2):
-            data_block_addr = (link_block[i+1], link_block[i])
-            if eof_reached:
-                assert data_block_addr == (0, 0)
-            elif data_block_addr == (0, 0):
-                eof_reached = True
-            else:
-                used_blocks.append(data_block_addr)
-                data += get_sector(imd, data_block_addr)
-        expected_prev_link_addr = link_addr
-        link_addr = next_link_addr
-
-    return data
-
-def print_file_block_addresses(link_addr):
-    expected_prev_link_addr = (0, 0)
-    eof_reached = False
-    data = bytearray()
-
-    while link_addr != (0, 0):
-        used_blocks.append(link_addr)
-        link_block = get_sector(imd, link_addr)
-        prev_link_addr = (link_block[1], link_block[0])
-        next_link_addr = (link_block[3], link_block[2])
-        assert prev_link_addr == expected_prev_link_addr
-        for i in range(4, bytes_per_linking_block, 2):
-            data_block_addr = (link_block[i+1], link_block[i])
-            if eof_reached:
-                assert data_block_addr == (0, 0)
-            elif data_block_addr == (0, 0):
-                eof_reached = True
-            else:
-                used_blocks.append(data_block_addr)
-                print('    %d %d' % (data_block_addr[0], data_block_addr[1]))
-        expected_prev_link_addr = link_addr
-        link_addr = next_link_addr
 
 
 # system files
@@ -199,88 +323,65 @@ if args.raw:
     imd = load_raw_image(args.image)
 else:
     imd = ImageDisk(args.image)
+filesystem = IsisFilesystem(imd, format)
 
-if args.destzip is not None:
+if args.extract and args.destzip is not None:
     destzip = zipfile.ZipFile(args.destzip, 'w', compression = zipfile.ZIP_DEFLATED)
 else:
     destzip = None
 
-if format == 'intel':
-    dir_link_addr = (1, 1)
-    dir = get_file_given_link_addr(imd, dir_link_addr)
-    dir_entry_len = 16
-    filename_len = 6
-    block_count_word = 12
-    byte_count_word_lsb = 11
-    byte_count_word_msb = 0 # Not used, so point to the byte that's always 0
-    link_address_word = 14
-elif format == 'tandberg dsdd':
-    dir_link_addr = (1, 4)
-    dir = get_tandberg_dsdd_dir(imd, dir_link_addr)
-    dir_entry_len = 32
-    filename_len = 8
-    block_count_word = 19
-    byte_count_word_lsb = 17
-    byte_count_word_msb = 18
-    link_address_word = 30
-else:
-    raise Exception('Unknoen disk format')
 if args.dir:
     print('filename     attr   length link block')
     print('------------ ------ ------ ----------')
-for i in range(len(dir)//dir_entry_len):
-    dir_entry = dir[i*dir_entry_len:(i+1)*dir_entry_len]
-    if dir_entry[0] == 0x7f:
-        continue # unused entry
-    elif dir_entry[0] == 0xff:
-        continue # deleted entry
-    else:
-        assert(dir_entry[0] == 0x00)
-    basename = dir_entry[1:filename_len+1].decode('ascii').rstrip('\0')
-    extension = dir_entry[filename_len+1:filename_len+4].decode('ascii').rstrip('\0')
-    filename = basename
-    if extension != '':
-        filename += '.' + extension
-    if args.lower:
-        filename = filename.lower()
 
-    if format == 'intel':
-        assert dir_entry[10] & 0x30 == 0
-        attributes = ('.F' [(dir_entry[10] >> 7) & 1] +
-                      '.X' [(dir_entry[10] >> 6) & 1] + # Tandberg OS Direct-Access file
-                      '.A' [(dir_entry[10] >> 3) & 1] + # Tandberg OS Alias file
-                      '.P' [(dir_entry[10] >> 2) & 1] +
-                      '.S' [(dir_entry[10] >> 1) & 1] +
-                      '.I' [(dir_entry[10] >> 0) & 1])
-    elif format == 'tandberg dsdd':
-        #
-        # New attributes in TOS-II include:
-        #  -> D: Direct file
-        #  -> M: Reserved
-        #  -> N: New file on harddisk (not backed up)
-        #
-        # However, the layout of the attribute word is unknown due to lack of documentation
-        #
-        attributes = '{:02X}.{:02X}.'.format(dir_entry[14], dir_entry[15])
+if args.mapdump:
+    print('\nBlocks used on disk:')
+    btrack = -1
+    for block in filesystem.get_used_blocks():
+        if btrack != block[0]:
+            btrack = block[0]
+            print('\nhead {} cyl {:02}:   '.format((btrack & 0x80) >> 7, btrack & 0x7F), end='')
+        print('{} '.format(block[1]), end='')
 
-    file_length = (dir_entry[block_count_word] + 256 * dir_entry[block_count_word+1]) * bytes_per_sector - bytes_per_sector + dir_entry[byte_count_word_lsb] + dir_entry[byte_count_word_msb]*256
-    link_addr = (dir_entry[link_address_word+1], dir_entry[link_address_word])
+    print('\n\nMapfile:\n\n    ', end='')
+    mapbyte_count = 0
+    for v in filesystem.get_mapfile():
+        mapbyte_count += 1
+        if mapbyte_count%16 == 0:
+            print('{:02X} \n    '.format(v), end='')
+        else:
+            print('{:02X} '.format(v), end='')
+
+for file in filesystem.get_files():
+    filename = file.get_filename(args.lower)
 
     if args.pattern is not None:
-        if not fnmatch.fnmatch(filename, args.pattern):
+        if not fnmatch.fnmatch(file.get_filename(), args.pattern):
             continue
 
     if args.dir:
-        print('%-12s %s %6d (%3d,%3d)' % (filename, attributes, file_length, link_addr[0], link_addr[1]))
+        print(file.get_directory_str())
         if args.debug:
-            print_file_block_addresses(link_addr)
+            link_blocks = filesystem.get_link_blocks(file)
+            data_blocks = filesystem.get_data_blocks(link_blocks)
+            print('\n    Linking blocks:')
+            for block in link_blocks:
+                print('        (%2d %2d) ' % (block[0], block[1]))
+            print('\n    Data blocks:', end = '')
+            i = 7
+            for block in data_blocks:
+                if i%8 == 7:
+                    print('\n        ', end = '')
+                print('(%3d %2d) ' % (block[0], block[1]), end='')
+                i += 1
+        print('\n\n--------------------------------------------------------------------------------\n')
         continue
 
     if args.extract:
-        file_data = get_file_given_link_addr(imd, link_addr)
+        file_data = filesystem.get_file_data(file)
         #print('file length, dir: %d  based on link blocks: %d' % (file_length, len(file_data)))
-        assert len(file_data) >= file_length
-        file_data = file_data[:file_length]
+        assert len(file_data) >= file.get_size()
+        file_data = file_data[:file.get_size()]
 
         if destzip is not None:
             destzip.writestr(filename, file_data)
@@ -291,44 +392,7 @@ for i in range(len(dir)//dir_entry_len):
                 path = filename
             with open(path, 'wb') as f:
                 f.write(file_data)
+
 if destzip is not None:
     destzip.close()
 
-if args.mapdump:
-
-    if format == 'intel':
-        map = [0 for _ in range(256)]
-    elif format == 'tandberg dsdd':
-        # Reserved by TOS-II, without assigning file-entries
-        for sector in range(1, 27):
-            used_blocks.append((0x80 + 1, sector))
-        for sector in range(1, 7):
-            used_blocks.append((2, sector))
-        map = [0 for _ in range(512)]
-
-    print('\nBlocks used during operation:')
-    used_blocks = list(set(used_blocks))
-    used_blocks.sort()
-    btrack = -1
-    for block in used_blocks:
-        if btrack != block[0]:
-            btrack = block[0]
-            print('\nhead {} cyl {:02}:   '.format((btrack & 0x80) >> 7, btrack & 0x7F), end='')
-        print('{} '.format(block[1]), end='')
-
-        if format == 'intel':
-            block_nr = block[0]*26 + (block[1]-1)
-        elif format == 'tandberg dsdd':
-            block_nr = (block[0]%0x80)*52 + int(block[0]/0x80)*26 + (block[1]-1) - 3*26
-        bit_mask = 0x80>>block_nr%8
-        byte_nr = int(block_nr/8)
-        map[byte_nr] = map[byte_nr]|bit_mask
-    print('\n\nmapfile (of directory and extracted files):\n\n    ', end='')
-
-    mapbyte_count = 0
-    for v in map:
-        mapbyte_count += 1
-        if mapbyte_count%16 == 0:
-            print('{:02X} \n    '.format(v), end='')
-        else:
-            print('{:02X} '.format(v), end='')
