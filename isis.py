@@ -29,10 +29,15 @@ from imagedisk import ImageDisk
 class LayoutFormat:
 
     def __init__(self, format):
+        self.tracks = 77
+        self.sectors = 26
         self.bytes_per_linking_block = 128
         if 'intel' in format:
             self.type = 'intel'
+            self.heads = 1
             self.bytes_per_block = 128
+            self.first_block = (0, 1)
+            self.dir_entry_len = 16
             self.filename_len = 6
             self.attribute_word = 10
             self.attribute_mask = 0xff
@@ -43,7 +48,10 @@ class LayoutFormat:
             self.attribute_list = {'I': 0, 'S': 1, 'P': 2, 'A': 3, 'X': 6, 'F': 7}
         elif format == 'tandberg dsdd':
             self.type = 'tandberg dsdd'
+            self.heads = 2
             self.bytes_per_block = 256
+            self.first_block = (0x80 + 1, 1)
+            self.dir_entry_len = 32
             self.filename_len = 8
             self.attribute_word = 14
             self.attribute_mask = 0xffff
@@ -54,6 +62,8 @@ class LayoutFormat:
             self.attribute_list = {} # Documentation missing, unknown bit-positions
         else:
             raise Exception('Unknown disk format')
+        if format == 'intel dd':
+            self.sectors = 52
 
 
 class IsisFile:
@@ -61,16 +71,17 @@ class IsisFile:
     def __init__(self, dir_entry, format):
         self.format = format
 
-        self.basename = dir_entry[1:format.filename_len+1].decode('ascii').rstrip('\0')
-        self.extension = dir_entry[format.filename_len+1:format.filename_len+4].decode('ascii').rstrip('\0')
-        self.attributes = {}
-        attribute_data = self._get_word(dir_entry, format.attribute_word, format.attribute_mask)
-        for attribute, bit in format.attribute_list.items():
-            self.attributes[attribute] = bool((attribute_data >> bit) & 1)
+        if dir_entry is not None:
+            self.basename = dir_entry[1:format.filename_len+1].decode('ascii').rstrip('\0')
+            self.extension = dir_entry[format.filename_len+1:format.filename_len+4].decode('ascii').rstrip('\0')
+            self.attributes = {}
+            attribute_data = self._get_word(dir_entry, format.attribute_word, format.attribute_mask)
+            for attribute, bit in format.attribute_list.items():
+                self.attributes[attribute] = bool((attribute_data >> bit) & 1)
 
-        self.whole_blocks_used = self._get_word(dir_entry, format.block_count_word) - 1
-        self.bytes_in_last_block = self._get_word(dir_entry, format.byte_count_word, format.byte_count_mask)
-        self.link_block_addr = (dir_entry[format.link_address_word+1], dir_entry[format.link_address_word])
+            self.whole_blocks_used = self._get_word(dir_entry, format.block_count_word) - 1
+            self.bytes_in_last_block = self._get_word(dir_entry, format.byte_count_word, format.byte_count_mask)
+            self.link_block_addr = (dir_entry[format.link_address_word+1], dir_entry[format.link_address_word])
 
     @staticmethod
     def _get_word(data, offset, mask = 0xFFFF):
@@ -102,6 +113,38 @@ class IsisFile:
     def get_directory_str(self, force_lowercase = False):
         return '%-12s %s %6d (%3d,%3d)' % (self.get_filename(force_lowercase), self.get_attribute_str(), self.get_size(), self.link_block_addr[0], self.link_block_addr[1])
 
+    def get_directory_entry(self):
+        entry = bytearray()
+        entry += b'\0'
+        entry += bytearray('{:{}}{:3}'.format(self.filename[:self.format.filename_len], self.format.filename_len, self.extension[:3]).replace(' ', '\0'), encoding = 'ascii')
+        entry += bytearray(self.format.dir_entry_len - (self.format.filename_len + 4))
+        if self.format == 'intel':
+            entry[self.format.attribute_word] = self.get_attribute_byte()
+            entry[self.format.block_count_word] = self.bytes_in_last_block
+        elif self.format == 'tandberg dd':
+            entry[self.format.block_count_word] = self.bytes_in_last_block&0xff
+            entry[self.format.block_count_word+1] = (self.bytes_in_last_block >> 8)&0xff
+        entry[self.format.block_count_word] = self.whole_blocks_used&0xff
+        entry[self.format.block_count_word+1] = (self.whole_blocks_used >> 8)&0xff
+        entry[self.format.link_address_word] = self.link_block_addr[1]
+        entry[self.format.link_address_word+1] = self.link_block_addr[0]
+        return entry
+
+
+class NewIsisFile(IsisFile):
+
+    def __init__(self, filename, size, format, link_block):
+        super().__init__(None, format)
+        self.basename = filename.split('.')[0][:format.filename_len]
+        if '.' in filename:
+            self.extension = filename.split('.')[-1][:3]
+        else:
+            self.extension = ''
+        self.attributes = {}
+        self.whole_blocks_used = int(size/format.bytes_per_block)
+        self.bytes_in_last_block = size - self.whole_blocks_used
+        self.link_block_addr = link_block
+
 
 class IsisFilesystem:
 
@@ -111,15 +154,13 @@ class IsisFilesystem:
         self.file_entries = []
         if format.type == 'intel':
             directory_data = self._get_intel_dir((1, 1))
-            dir_entry_len = 16
         elif format.type == 'tandberg dsdd':
             directory_data = self._get_tandberg_dsdd_dir((1, 4))
-            dir_entry_len = 32
         else:
             raise Exception('Unknown disk format')
 
-        for i in range(len(directory_data)//dir_entry_len):
-            dir_entry = directory_data[i*dir_entry_len:(i+1)*dir_entry_len]
+        for i in range(len(directory_data)//format.dir_entry_len):
+            dir_entry = directory_data[i*format.dir_entry_len:(i+1)*format.dir_entry_len]
             if dir_entry[0] == 0x7f:
                 continue # unused entry
             elif dir_entry[0] == 0xff:
@@ -211,6 +252,24 @@ class IsisFilesystem:
             byte_nr = int(block_nr/8)
             map[byte_nr] = map[byte_nr]|bit_mask
         return map
+
+    def get_next_free_block(self):
+        used_blocks = self.get_used_blocks()
+        cylinder = self.format.first_block[0]&0x7f
+        head = (self.format.first_block[0]&0x80)>>7
+        sector = self.format.first_block[1]
+        while cylinder < self.format.tracks:
+            head = head%self.format.heads
+            while head < self.format.heads:
+                sector = sector%self.format.sectors+1
+                while sector <= self.format.sectors:
+                    block_addr = ((cylinder&0x7f)|((head&0x01) << 7), sector)
+                    if block_addr not in used_blocks:
+                        return block_addr
+                    sector += 1
+                head += 1
+            cylinder += 1
+        return None
 
 
 def hex_dump(b):
